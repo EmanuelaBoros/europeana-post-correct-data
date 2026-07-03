@@ -14,21 +14,26 @@ Pipeline:
 7. Automatically flag risky examples.
 8. Write JSONL output for later human verification.
 
-Example:
+Example with API:
 
-python build_chronocorrect_europeana.py \
-  --output-jsonl chronocorrect_europeana_fr_mini.jsonl \
+python build_dataset.py \
+  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
   --max-examples 1000 \
+  --max-pages 50000 \
   --language fr \
   --model-correction gpt-5-mini \
-  --model-annotation gpt-5-mini
+  --model-annotation gpt-5-mini \
+  --resume \
+  --verbose
 
 Dry run without API:
 
-python build_chronocorrect_europeana.py \
-  --output-jsonl sample_no_api.jsonl \
+python build_dataset.py \
+  --output-jsonl outputs/sample_no_api.jsonl \
   --max-examples 50 \
-  --no-api
+  --max-pages 500 \
+  --no-api \
+  --verbose
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from datasets import load_dataset
 from tqdm import tqdm
@@ -80,7 +85,7 @@ DATE_PATTERN = re.compile(
         |
         \d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}
         |
-        \b(?:18|19|20)\d{{2}}\b
+        (?:18|19|20)\d{{2}}
     )\b
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -99,7 +104,7 @@ NUMBER_PATTERN = re.compile(
 
 
 # ---------------------------------------------------------------------
-# Correction prompts
+# Prompts
 # ---------------------------------------------------------------------
 
 CORRECTION_SYSTEM_PROMPT = """You are correcting OCR errors in historical French newspaper text.
@@ -277,7 +282,9 @@ def stable_hash(text: str, length: int = 16) -> str:
 
 
 def get_first_existing(
-    example: Dict[str, Any], keys: List[str], default: Any = None
+    example: Dict[str, Any],
+    keys: List[str],
+    default: Any = None,
 ) -> Any:
     for key in keys:
         if key in example and example[key] is not None:
@@ -314,7 +321,6 @@ def is_target_language(example: Dict[str, Any], target_language: str) -> bool:
     }
 
     accepted = aliases.get(target_language, {target_language})
-
     return any(v in accepted for v in values)
 
 
@@ -357,6 +363,7 @@ def split_into_paragraphs(
 
             sentences = re.split(r"(?<=[.!?;:])\s+", chunk)
             sub_buffer = ""
+
             for sent in sentences:
                 if len(sub_buffer) + len(sent) + 1 <= max_chars:
                     sub_buffer = (sub_buffer + " " + sent).strip()
@@ -364,8 +371,10 @@ def split_into_paragraphs(
                     if len(sub_buffer) >= min_chars:
                         paragraphs.append(sub_buffer)
                     sub_buffer = sent
+
             if len(sub_buffer) >= min_chars:
                 paragraphs.append(sub_buffer)
+
             continue
 
         if len(buffer) + len(chunk) + 1 <= max_chars:
@@ -386,6 +395,7 @@ def looks_like_bad_paragraph(text: str) -> bool:
         return True
 
     stripped = text.strip()
+
     if len(stripped) < 20:
         return True
 
@@ -393,15 +403,19 @@ def looks_like_bad_paragraph(text: str) -> bool:
     if alpha / max(len(stripped), 1) < 0.45:
         return True
 
-    # Very layout-like / table-like fragments
     if stripped.count("|") > 5:
         return True
 
-    # Repeated garbage characters
     if re.search(r"(.)\1{10,}", stripped):
         return True
 
     return False
+
+
+def ensure_output_dir(path: str) -> None:
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
 
 
 # ---------------------------------------------------------------------
@@ -418,6 +432,7 @@ def load_spacy_model(model_name: str):
         return None
 
     try:
+        tqdm.write(f"[setup] Loading spaCy model: {model_name}")
         return spacy.load(model_name)
     except Exception:
         print(
@@ -491,20 +506,31 @@ def make_openai_client():
         raise RuntimeError(
             "openai package is not installed. Install with: pip install openai"
         )
+
     if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+        raise RuntimeError(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Set it with: export OPENAI_API_KEY='your_key'"
+        )
+
     return OpenAI()
 
 
 def call_with_retries(fn, retries: int = 3, sleep_seconds: float = 5.0):
     last_err = None
+
     for attempt in range(retries):
         try:
             return fn()
         except Exception as err:
             last_err = err
+            tqdm.write(f"[retry] Attempt {attempt + 1}/{retries} failed: {repr(err)}")
+
             if attempt < retries - 1:
-                time.sleep(sleep_seconds * (attempt + 1))
+                sleep_for = sleep_seconds * (attempt + 1)
+                tqdm.write(f"[retry] Sleeping {sleep_for:.1f}s before retry.")
+                time.sleep(sleep_for)
+
     raise last_err
 
 
@@ -517,14 +543,18 @@ def correct_with_openai(
     retries: int = 3,
 ) -> str:
     context_lines = []
+
     if title:
         context_lines.append(f"Newspaper title: {title}")
+
     if date:
         context_lines.append(f"Publication date: {date}")
 
     user_prompt = "\n".join(context_lines)
+
     if user_prompt:
         user_prompt += "\n\n"
+
     user_prompt += f"OCR text:\n{ocr_text}"
 
     def _call():
@@ -583,10 +613,6 @@ Corrected text:
 # ---------------------------------------------------------------------
 # Risk detection
 # ---------------------------------------------------------------------
-
-
-def list_texts(items: List[Dict[str, Any]], key: str = "text") -> set:
-    return {str(x.get(key, "")).lower() for x in items if x.get(key)}
 
 
 def automatic_risk_flags(
@@ -673,6 +699,7 @@ def make_source_id(example: Dict[str, Any], fallback_index: int) -> str:
         value = example.get(key)
         if value:
             return str(value)
+
     text = str(get_first_existing(example, ["text", "ocr_text", "content"], ""))
     return f"source_{fallback_index}_{stable_hash(text)}"
 
@@ -682,17 +709,49 @@ def iter_candidate_paragraphs(
     args,
     nlp=None,
 ) -> Iterator[CandidateParagraph]:
-    seen = 0
+    seen_pages = 0
+    skipped_language = 0
+    skipped_no_text = 0
+    total_paragraphs = 0
+    skipped_bad_paragraphs = 0
+    skipped_not_selected = 0
+    yielded = 0
+
+    scan_pbar = tqdm(
+        total=args.max_pages,
+        desc="Scanning source pages",
+        unit="page",
+        leave=True,
+    )
 
     for source_index, example in enumerate(examples):
-        if args.max_pages is not None and seen >= args.max_pages:
+        if args.max_pages is not None and seen_pages >= args.max_pages:
             break
 
+        scan_pbar.update(1)
+
         if args.language and not is_target_language(example, args.language):
+            skipped_language += 1
+            scan_pbar.set_postfix(
+                {
+                    "kept": yielded,
+                    "skip_lang": skipped_language,
+                    "paragraphs": total_paragraphs,
+                }
+            )
             continue
 
         text = get_first_existing(example, ["text", "ocr_text", "content", "full_text"])
+
         if not isinstance(text, str) or not text.strip():
+            skipped_no_text += 1
+            scan_pbar.set_postfix(
+                {
+                    "kept": yielded,
+                    "no_text": skipped_no_text,
+                    "paragraphs": total_paragraphs,
+                }
+            )
             continue
 
         title = get_first_existing(
@@ -705,16 +764,19 @@ def iter_candidate_paragraphs(
         std_ocr = safe_float(get_first_existing(example, ["std_ocr", "ocr_std"]))
 
         source_id = make_source_id(example, source_index)
+
         paragraphs = split_into_paragraphs(
             text,
             min_chars=args.min_chars,
             max_chars=args.max_chars,
         )
 
-        seen += 1
+        seen_pages += 1
+        total_paragraphs += len(paragraphs)
 
         for para_index, paragraph in enumerate(paragraphs):
             if looks_like_bad_paragraph(paragraph):
+                skipped_bad_paragraphs += 1
                 continue
 
             features = detect_entities_dates_numbers(paragraph, nlp=nlp)
@@ -724,9 +786,11 @@ def iter_candidate_paragraphs(
                 reasons = reasons or ["selected_by_select_all"]
 
             if not reasons:
+                skipped_not_selected += 1
                 continue
 
             metadata = {}
+
             for key in [
                 "url",
                 "iiif_url",
@@ -743,13 +807,23 @@ def iter_candidate_paragraphs(
             ]:
                 if key in example:
                     value = example[key]
-                    # Avoid huge metadata blobs
+
                     if key == "bounding_boxes":
                         metadata[key] = "present"
                     else:
                         metadata[key] = value
 
             paragraph_id = f"{source_id}_p{para_index}_{stable_hash(paragraph)}"
+            yielded += 1
+
+            scan_pbar.set_postfix(
+                {
+                    "kept": yielded,
+                    "paragraphs": total_paragraphs,
+                    "bad": skipped_bad_paragraphs,
+                    "not_selected": skipped_not_selected,
+                }
+            )
 
             yield CandidateParagraph(
                 source_id=source_id,
@@ -765,6 +839,17 @@ def iter_candidate_paragraphs(
                 selection_reasons=reasons,
             )
 
+    scan_pbar.close()
+
+    tqdm.write("Source scanning finished.")
+    tqdm.write(f"Pages seen: {seen_pages}")
+    tqdm.write(f"Candidates yielded: {yielded}")
+    tqdm.write(f"Paragraphs created: {total_paragraphs}")
+    tqdm.write(f"Skipped language: {skipped_language}")
+    tqdm.write(f"Skipped no text: {skipped_no_text}")
+    tqdm.write(f"Skipped bad paragraphs: {skipped_bad_paragraphs}")
+    tqdm.write(f"Skipped not selected: {skipped_not_selected}")
+
 
 # ---------------------------------------------------------------------
 # Output helpers
@@ -776,6 +861,7 @@ def load_existing_ids(path: str) -> set:
         return set()
 
     ids = set()
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -783,16 +869,19 @@ def load_existing_ids(path: str) -> set:
                 ids.add(obj.get("id"))
             except Exception:
                 continue
+
     return ids
 
 
 def write_jsonl_record(path: str, record: Dict[str, Any]) -> None:
+    ensure_output_dir(path)
+
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------
-# Main
+# Args
 # ---------------------------------------------------------------------
 
 
@@ -806,116 +895,137 @@ def parse_args() -> argparse.Namespace:
         default="biglam/europeana_newspapers",
         help="HF dataset name.",
     )
+
     parser.add_argument(
         "--split",
         default="train",
         help="HF split to load.",
     )
+
     parser.add_argument(
         "--language",
         default="fr",
         help="Target language code, e.g. fr.",
     )
+
     parser.add_argument(
         "--output-jsonl",
         required=True,
         help="Output JSONL file.",
     )
+
     parser.add_argument(
         "--max-pages",
         type=int,
         default=None,
         help="Maximum source pages/documents to scan.",
     )
+
     parser.add_argument(
         "--max-examples",
         type=int,
         default=1000,
         help="Maximum selected paragraph examples to output.",
     )
+
     parser.add_argument(
         "--min-chars",
         type=int,
         default=120,
         help="Minimum paragraph length.",
     )
+
     parser.add_argument(
         "--max-chars",
         type=int,
         default=1200,
         help="Maximum paragraph length.",
     )
+
     parser.add_argument(
         "--low-ocr-threshold",
         type=float,
         default=0.80,
         help="Mean OCR confidence threshold for low OCR selection.",
     )
+
     parser.add_argument(
         "--spacy-model",
         default="fr_core_news_md",
         help="spaCy model for NER.",
     )
+
     parser.add_argument(
         "--model-correction",
         default="gpt-5-mini",
         help="OpenAI model for correction.",
     )
+
     parser.add_argument(
         "--model-annotation",
         default="gpt-5-mini",
         help="OpenAI model for structured annotation.",
     )
+
     parser.add_argument(
         "--no-api",
         action="store_true",
         help="Do not call OpenAI API. Use OCR text as corrected_text placeholder.",
     )
+
     parser.add_argument(
         "--select-all",
         action="store_true",
         help="Select all valid paragraphs, not only semantic/low-OCR ones.",
     )
+
     parser.add_argument(
         "--streaming",
         action="store_true",
         default=True,
         help="Use HF streaming mode.",
     )
+
     parser.add_argument(
         "--no-streaming",
         action="store_false",
         dest="streaming",
         help="Disable HF streaming.",
     )
+
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Pass trust_remote_code=True to load_dataset.",
     )
+
     parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from existing output JSONL, skipping existing IDs.",
     )
+
     parser.add_argument(
         "--seed",
         type=int,
         default=13,
         help="Random seed.",
     )
+
     parser.add_argument(
         "--sleep",
         type=float,
         default=0.0,
         help="Sleep seconds between API examples.",
     )
+
     parser.add_argument(
         "--api-retries",
         type=int,
         default=3,
         help="Number of retries for API calls.",
     )
+
     parser.add_argument(
         "--gold-candidate-risk-threshold",
         type=int,
@@ -923,20 +1033,50 @@ def parse_args() -> argparse.Namespace:
         help="Risk score threshold for needs_human_verification.",
     )
 
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print extra progress messages.",
+    )
+
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 
 
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
 
+    ensure_output_dir(args.output_jsonl)
+
+    tqdm.write("[setup] Starting ChronoCorrect-Europeana builder")
+    tqdm.write(f"[setup] Dataset: {args.dataset_name}")
+    tqdm.write(f"[setup] Split: {args.split}")
+    tqdm.write(f"[setup] Language: {args.language}")
+    tqdm.write(f"[setup] Output: {args.output_jsonl}")
+    tqdm.write(f"[setup] Max examples: {args.max_examples}")
+    tqdm.write(f"[setup] Max pages: {args.max_pages}")
+    tqdm.write(f"[setup] No API mode: {args.no_api}")
+
     nlp = load_spacy_model(args.spacy_model)
 
     client = None
     if not args.no_api:
+        tqdm.write("[setup] Creating OpenAI client")
         client = make_openai_client()
+    else:
+        tqdm.write("[setup] Skipping OpenAI client because --no-api is enabled")
 
     existing_ids = load_existing_ids(args.output_jsonl) if args.resume else set()
+
+    if args.resume:
+        tqdm.write(f"[setup] Resume enabled. Existing IDs loaded: {len(existing_ids)}")
+
+    tqdm.write("[setup] Loading Hugging Face dataset stream")
 
     source_examples = iter_source_examples(
         dataset_name=args.dataset_name,
@@ -945,25 +1085,76 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
     )
 
+    tqdm.write("[setup] Creating candidate paragraph iterator")
+
     candidates = iter_candidate_paragraphs(source_examples, args, nlp=nlp)
 
     written = 0
     skipped_existing = 0
 
-    pbar = tqdm(total=args.max_examples, desc="Building ChronoCorrect")
+    step_stats = {
+        "seen_candidates": 0,
+        "skipped_existing": 0,
+        "corrected": 0,
+        "annotated": 0,
+        "risk_flagged": 0,
+        "written": 0,
+        "api_errors": 0,
+    }
+
+    pbar = tqdm(
+        total=args.max_examples,
+        desc="Writing ChronoCorrect records",
+        unit="example",
+        leave=True,
+    )
 
     for candidate in candidates:
         if written >= args.max_examples:
             break
 
-        record_id = f"chronocorrect_europeana_{candidate.language}_{stable_hash(candidate.paragraph_id)}"
+        step_stats["seen_candidates"] += 1
+
+        record_id = (
+            f"chronocorrect_europeana_{candidate.language}_"
+            f"{stable_hash(candidate.paragraph_id)}"
+        )
+
+        if args.verbose:
+            tqdm.write(
+                f"[candidate] {step_stats['seen_candidates']} | "
+                f"id={candidate.paragraph_id} | "
+                f"chars={len(candidate.ocr_text)} | "
+                f"reasons={candidate.selection_reasons}"
+            )
+
+        pbar.set_postfix(
+            {
+                "stage": "candidate",
+                "seen": step_stats["seen_candidates"],
+                "written": written,
+                "risk": step_stats["risk_flagged"],
+            }
+        )
 
         if record_id in existing_ids:
             skipped_existing += 1
+            step_stats["skipped_existing"] += 1
+
+            pbar.set_postfix(
+                {
+                    "stage": "skip_existing",
+                    "skipped": step_stats["skipped_existing"],
+                    "written": written,
+                }
+            )
             continue
 
         if args.no_api:
+            pbar.set_postfix({"stage": "no_api_placeholder", "written": written})
+
             corrected_text = candidate.ocr_text
+
             llm_annotation = {
                 "correction_tags": [],
                 "changed_entities": [],
@@ -974,27 +1165,63 @@ def main() -> None:
                 "uncertain_readings": [],
                 "short_rationale": "No API mode: correction and annotation not generated.",
             }
-        else:
-            corrected_text = correct_with_openai(
-                client=client,
-                ocr_text=candidate.ocr_text,
-                model=args.model_correction,
-                date=candidate.date,
-                title=candidate.title,
-                retries=args.api_retries,
-            )
 
-            llm_annotation = annotate_with_openai(
-                client=client,
-                ocr_text=candidate.ocr_text,
-                corrected_text=corrected_text,
-                model=args.model_annotation,
-                date=candidate.date,
-                title=candidate.title,
-                retries=args.api_retries,
-            )
+        else:
+            try:
+                pbar.set_postfix(
+                    {
+                        "stage": "gpt_correction",
+                        "written": written,
+                        "chars": len(candidate.ocr_text),
+                    }
+                )
+
+                corrected_text = correct_with_openai(
+                    client=client,
+                    ocr_text=candidate.ocr_text,
+                    model=args.model_correction,
+                    date=candidate.date,
+                    title=candidate.title,
+                    retries=args.api_retries,
+                )
+
+                step_stats["corrected"] += 1
+
+                pbar.set_postfix(
+                    {
+                        "stage": "gpt_annotation",
+                        "written": written,
+                        "corrected": step_stats["corrected"],
+                    }
+                )
+
+                llm_annotation = annotate_with_openai(
+                    client=client,
+                    ocr_text=candidate.ocr_text,
+                    corrected_text=corrected_text,
+                    model=args.model_annotation,
+                    date=candidate.date,
+                    title=candidate.title,
+                    retries=args.api_retries,
+                )
+
+                step_stats["annotated"] += 1
+
+            except Exception as err:
+                step_stats["api_errors"] += 1
+                tqdm.write(f"[API ERROR] {record_id}: {repr(err)}")
+
+                if args.resume:
+                    tqdm.write("[INFO] Continuing because --resume is enabled.")
+                    continue
+
+                raise
+
+        pbar.set_postfix({"stage": "post_ner", "written": written})
 
         post_features = detect_entities_dates_numbers(corrected_text, nlp=nlp)
+
+        pbar.set_postfix({"stage": "risk_flags", "written": written})
 
         risk_flags = automatic_risk_flags(
             ocr_text=candidate.ocr_text,
@@ -1004,9 +1231,19 @@ def main() -> None:
             llm_annotation=llm_annotation,
         )
 
-        # Allow CLI threshold override
         risk_flags["needs_human_verification"] = (
             risk_flags["risk_score"] >= args.gold_candidate_risk_threshold
+        )
+
+        if risk_flags["needs_human_verification"]:
+            step_stats["risk_flagged"] += 1
+
+        pbar.set_postfix(
+            {
+                "stage": "writing",
+                "written": written,
+                "risk": step_stats["risk_flagged"],
+            }
         )
 
         record = {
@@ -1047,17 +1284,33 @@ def main() -> None:
         write_jsonl_record(args.output_jsonl, record)
 
         written += 1
+        step_stats["written"] = written
+
         pbar.update(1)
 
+        pbar.set_postfix(
+            {
+                "stage": "done_record",
+                "written": written,
+                "risk": step_stats["risk_flagged"],
+                "api_errors": step_stats["api_errors"],
+            }
+        )
+
         if args.sleep > 0:
+            pbar.set_postfix({"stage": f"sleep_{args.sleep}s", "written": written})
             time.sleep(args.sleep)
 
     pbar.close()
 
-    print(f"Done.")
+    print("\nDone.")
     print(f"Wrote: {written}")
     print(f"Skipped existing: {skipped_existing}")
     print(f"Output: {args.output_jsonl}")
+
+    print("\nStep statistics:")
+    for key, value in step_stats.items():
+        print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":
