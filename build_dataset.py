@@ -13,6 +13,8 @@ Pipeline:
 6. Run NER/date/number detection before and after correction.
 7. Automatically flag risky examples.
 8. Write JSONL output for later human verification.
+9. Optionally export to Hugging Face DatasetDict.
+10. Optionally push to Hugging Face Hub.
 
 Example with API:
 
@@ -34,6 +36,26 @@ python build_dataset.py \
   --max-pages 500 \
   --no-api \
   --verbose
+
+Export existing JSONL to HF format:
+
+python build_dataset.py \
+  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
+  --export-only \
+  --export-hf \
+  --hf-output-dir hf_dataset
+
+Push existing JSONL to HF Hub:
+
+export HF_TOKEN="hf_..."
+
+python build_dataset.py \
+  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
+  --export-only \
+  --export-hf \
+  --push-to-hub \
+  --hub-dataset-id EmanuelaBoros/chronocorrect-europeana-fr-mini \
+  --private
 """
 
 from __future__ import annotations
@@ -49,7 +71,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------
@@ -65,6 +87,11 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+try:
+    from huggingface_hub import login as hf_login
+except ImportError:
+    hf_login = None
 
 
 # ---------------------------------------------------------------------
@@ -881,6 +908,209 @@ def write_jsonl_record(path: str, record: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------
+# Hugging Face export / push
+# ---------------------------------------------------------------------
+
+
+def load_jsonl_records(path: str) -> List[Dict[str, Any]]:
+    records = []
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"JSONL file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="Loading JSONL records", unit="line"):
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+
+    return records
+
+
+def make_hf_dataset_from_jsonl(
+    jsonl_path: str,
+    validation_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 13,
+) -> DatasetDict:
+    records = load_jsonl_records(jsonl_path)
+
+    if not records:
+        raise ValueError(f"No records found in {jsonl_path}")
+
+    rng = random.Random(seed)
+    rng.shuffle(records)
+
+    n_total = len(records)
+    n_test = int(n_total * test_ratio)
+    n_val = int(n_total * validation_ratio)
+
+    test_records = records[:n_test]
+    val_records = records[n_test : n_test + n_val]
+    train_records = records[n_test + n_val :]
+
+    dataset_dict = DatasetDict()
+
+    dataset_dict["train"] = Dataset.from_list(train_records)
+
+    if val_records:
+        dataset_dict["validation"] = Dataset.from_list(val_records)
+
+    if test_records:
+        dataset_dict["test"] = Dataset.from_list(test_records)
+
+    return dataset_dict
+
+
+def write_dataset_card(
+    output_dir: str,
+    source_dataset: str,
+    language: str,
+    model_correction: str,
+    model_annotation: str,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    readme_path = os.path.join(output_dir, "README.md")
+
+    card = f"""---
+language:
+- {language}
+task_categories:
+- text2text-generation
+- token-classification
+- text-classification
+pretty_name: ChronoCorrect Europeana
+tags:
+- historical-newspapers
+- ocr-post-correction
+- cultural-heritage
+- europeana
+- llm-generated
+- named-entities
+- temporal-expressions
+---
+
+# ChronoCorrect-Europeana
+
+This dataset is a derived post-OCR correction resource built from `{source_dataset}`.
+
+It pairs historical newspaper OCR text with conservative OCR post-correction candidates and semantic-risk annotations. The goal is to support evaluation of post-OCR correction beyond character-level metrics, with attention to named entities, dates, numbers, hallucination risk, and overcorrection.
+
+## Dataset construction
+
+The pipeline:
+
+1. Loads historical newspaper OCR text from `{source_dataset}`.
+2. Filters the `{language}` subset.
+3. Splits long OCR pages into paragraph-sized examples.
+4. Selects paragraphs containing named entities, dates, numbers, or low OCR confidence.
+5. Generates conservative OCR post-correction with `{model_correction}`.
+6. Generates structured semantic annotations with `{model_annotation}`.
+7. Runs automatic entity/date/number detection before and after correction.
+8. Flags risky examples for later human verification.
+
+## Main fields
+
+- `ocr_text`: original OCR paragraph.
+- `corrected_text`: conservative OCR post-correction candidate.
+- `correction_policy`: currently `conservative`.
+- `selection_reasons`: why the paragraph was selected.
+- `pre_correction_features`: entities, dates, and numbers detected before correction.
+- `post_correction_features`: entities, dates, and numbers detected after correction.
+- `llm_annotation`: structured LLM annotation of correction types and semantic changes.
+- `automatic_risk_flags`: automatic flags for entity/date/number changes, hallucination risk, and overcorrection risk.
+- `human_verification`: placeholder fields for manual validation.
+
+## Important note
+
+This is a silver dataset. The `corrected_text` and `llm_annotation` fields are generated automatically and should be treated as candidate annotations unless `annotation_status` indicates human verification.
+
+## Intended uses
+
+- OCR post-correction
+- Conservative historical text repair
+- Entity-aware OCR correction
+- Date and number preservation evaluation
+- Hallucination and overcorrection analysis
+- Downstream historical NLP evaluation
+
+## Limitations
+
+The corrections are automatically generated and may contain errors. The dataset is not a diplomatic transcription of the original page images. It is intended as a post-correction benchmark and candidate annotation resource.
+
+## Source
+
+Derived from `{source_dataset}`.
+
+## Citation
+
+Please cite the original Europeana Newspapers source dataset and this derived dataset if used.
+"""
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(card)
+
+    return readme_path
+
+
+def export_and_optionally_push_to_hub(args) -> None:
+    if not args.export_hf and not args.push_to_hub:
+        return
+
+    tqdm.write("[hf] Loading JSONL output into Hugging Face DatasetDict")
+
+    dataset_dict = make_hf_dataset_from_jsonl(
+        jsonl_path=args.output_jsonl,
+        validation_ratio=args.validation_ratio,
+        test_ratio=args.test_ratio,
+        seed=args.seed,
+    )
+
+    tqdm.write(f"[hf] DatasetDict created: {dataset_dict}")
+
+    if args.hf_output_dir:
+        tqdm.write(f"[hf] Saving dataset locally to: {args.hf_output_dir}")
+        dataset_dict.save_to_disk(args.hf_output_dir)
+
+        readme_path = write_dataset_card(
+            output_dir=args.hf_output_dir,
+            source_dataset=args.dataset_name,
+            language=args.language,
+            model_correction=args.model_correction,
+            model_annotation=args.model_annotation,
+        )
+
+        tqdm.write(f"[hf] Wrote dataset card: {readme_path}")
+
+    if args.push_to_hub:
+        if not args.hub_dataset_id:
+            raise ValueError("--hub-dataset-id is required when using --push-to-hub")
+
+        if args.hf_token:
+            if hf_login is None:
+                raise RuntimeError(
+                    "huggingface_hub is not installed. "
+                    "Install with: pip install huggingface_hub"
+                )
+
+            tqdm.write("[hf] Logging in with provided HF token")
+            hf_login(token=args.hf_token)
+
+        tqdm.write(f"[hf] Pushing dataset to hub: {args.hub_dataset_id}")
+
+        dataset_dict.push_to_hub(
+            args.hub_dataset_id,
+            private=args.private,
+            commit_message=args.commit_message,
+        )
+
+        tqdm.write(
+            f"[hf] Pushed dataset to: https://huggingface.co/datasets/{args.hub_dataset_id}"
+        )
+
+
+# ---------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------
 
@@ -1039,6 +1269,68 @@ def parse_args() -> argparse.Namespace:
         help="Print extra progress messages.",
     )
 
+    parser.add_argument(
+        "--export-only",
+        action="store_true",
+        help="Only export/push an existing JSONL file; do not build new records.",
+    )
+
+    parser.add_argument(
+        "--export-hf",
+        action="store_true",
+        help="Convert output JSONL to a Hugging Face DatasetDict and save locally.",
+    )
+
+    parser.add_argument(
+        "--hf-output-dir",
+        default="hf_dataset",
+        help="Local directory for DatasetDict.save_to_disk().",
+    )
+
+    parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.1,
+        help="Validation split ratio for HF export.",
+    )
+
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.1,
+        help="Test split ratio for HF export.",
+    )
+
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Push the exported DatasetDict to the Hugging Face Hub.",
+    )
+
+    parser.add_argument(
+        "--hub-dataset-id",
+        default=None,
+        help="HF dataset repo ID, e.g. EmanuelaBoros/chronocorrect-europeana-fr-mini.",
+    )
+
+    parser.add_argument(
+        "--hf-token",
+        default=os.getenv("HF_TOKEN"),
+        help="HF token. Defaults to HF_TOKEN environment variable.",
+    )
+
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="Create/push the HF dataset as private.",
+    )
+
+    parser.add_argument(
+        "--commit-message",
+        default="Upload ChronoCorrect-Europeana dataset",
+        help="Commit message for push_to_hub.",
+    )
+
     return parser.parse_args()
 
 
@@ -1061,6 +1353,11 @@ def main() -> None:
     tqdm.write(f"[setup] Max examples: {args.max_examples}")
     tqdm.write(f"[setup] Max pages: {args.max_pages}")
     tqdm.write(f"[setup] No API mode: {args.no_api}")
+    tqdm.write(f"[setup] Export only: {args.export_only}")
+
+    if args.export_only:
+        export_and_optionally_push_to_hub(args)
+        return
 
     nlp = load_spacy_model(args.spacy_model)
 
@@ -1311,6 +1608,8 @@ def main() -> None:
     print("\nStep statistics:")
     for key, value in step_stats.items():
         print(f"  {key}: {value}")
+
+    export_and_optionally_push_to_hub(args)
 
 
 if __name__ == "__main__":
