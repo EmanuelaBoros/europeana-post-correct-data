@@ -13,48 +13,35 @@ Pipeline:
 6. Run NER/date/number detection before and after correction.
 7. Automatically flag risky examples.
 8. Write JSONL output for later human verification.
-9. Optionally export to Hugging Face DatasetDict.
+9. Optionally export to a flat Hugging Face DatasetDict.
 10. Optionally push to Hugging Face Hub.
 
-Example with API:
+Important:
+- Use --resume to skip records already present in the JSONL.
+- Use --target-total-examples to continue until the JSONL reaches a total size.
+- HF export uses a flat schema: nested fields are saved as JSON strings to avoid
+  train/validation/test schema mismatches.
+
+Example: continue until 200 total examples
 
 python build_dataset.py \
-  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
-  --max-examples 1000 \
-  --max-pages 50000 \
+  --output-jsonl outputs/chronocorrect_europeana_fr_test.jsonl \
+  --target-total-examples 200 \
+  --max-pages 10000 \
   --language fr \
   --model-correction gpt-5-mini \
   --model-annotation gpt-5-mini \
   --resume \
   --verbose
 
-Dry run without API:
+Export and push after generation:
 
 python build_dataset.py \
-  --output-jsonl outputs/sample_no_api.jsonl \
-  --max-examples 50 \
-  --max-pages 500 \
-  --no-api \
-  --verbose
-
-Export existing JSONL to HF format:
-
-python build_dataset.py \
-  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
-  --export-only \
-  --export-hf \
-  --hf-output-dir hf_dataset
-
-Push existing JSONL to HF Hub:
-
-export HF_TOKEN="hf_..."
-
-python build_dataset.py \
-  --output-jsonl outputs/chronocorrect_europeana_fr_mini.jsonl \
+  --output-jsonl outputs/chronocorrect_europeana_fr_test.jsonl \
   --export-only \
   --export-hf \
   --push-to-hub \
-  --hub-dataset-id EmanuelaBoros/chronocorrect-europeana-fr-mini \
+  --hub-dataset-id EmanuelaBoros/chronocorrect-europeana-fr \
   --private
 """
 
@@ -71,7 +58,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------
@@ -360,6 +347,31 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def ensure_output_dir(path: str) -> None:
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+
+
+def count_jsonl_records(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+
+    count = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+                count += 1
+            except Exception:
+                continue
+
+    return count
+
+
 def split_into_paragraphs(
     text: str,
     min_chars: int = 120,
@@ -437,12 +449,6 @@ def looks_like_bad_paragraph(text: str) -> bool:
         return True
 
     return False
-
-
-def ensure_output_dir(path: str) -> None:
-    dirname = os.path.dirname(path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
 
 
 # ---------------------------------------------------------------------
@@ -908,7 +914,7 @@ def write_jsonl_record(path: str, record: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------
-# Hugging Face export / push
+# Flat Hugging Face export / push
 # ---------------------------------------------------------------------
 
 
@@ -923,9 +929,91 @@ def load_jsonl_records(path: str) -> List[Dict[str, Any]]:
             line = line.strip()
             if not line:
                 continue
-            records.append(json.loads(line))
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
 
     return records
+
+
+def json_string(x: Any) -> str:
+    if x is None:
+        x = {}
+    return json.dumps(x, ensure_ascii=False)
+
+
+def as_string(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    return str(x)
+
+
+def as_float_or_none(x: Any):
+    if x is None or x == "":
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def flatten_record_for_hf(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": as_string(record.get("id")),
+        "source_dataset": as_string(record.get("source_dataset")),
+        "source_id": as_string(record.get("source_id")),
+        "paragraph_id": as_string(record.get("paragraph_id")),
+        "language": as_string(record.get("language")),
+        "title": as_string(record.get("title")),
+        "date": as_string(record.get("date")),
+        "mean_ocr": as_float_or_none(record.get("mean_ocr")),
+        "std_ocr": as_float_or_none(record.get("std_ocr")),
+        "ocr_text": as_string(record.get("ocr_text")),
+        "corrected_text": as_string(record.get("corrected_text")),
+        "correction_policy": as_string(record.get("correction_policy")),
+        "annotation_status": as_string(record.get("annotation_status")),
+        "selection_reasons_json": json_string(record.get("selection_reasons")),
+        "pre_correction_features_json": json_string(
+            record.get("pre_correction_features")
+        ),
+        "post_correction_features_json": json_string(
+            record.get("post_correction_features")
+        ),
+        "llm_annotation_json": json_string(record.get("llm_annotation")),
+        "automatic_risk_flags_json": json_string(record.get("automatic_risk_flags")),
+        "human_verification_json": json_string(record.get("human_verification")),
+        "source_metadata_json": json_string(record.get("source_metadata")),
+    }
+
+
+def flat_hf_features() -> Features:
+    return Features(
+        {
+            "id": Value("string"),
+            "source_dataset": Value("string"),
+            "source_id": Value("string"),
+            "paragraph_id": Value("string"),
+            "language": Value("string"),
+            "title": Value("string"),
+            "date": Value("string"),
+            "mean_ocr": Value("float64"),
+            "std_ocr": Value("float64"),
+            "ocr_text": Value("string"),
+            "corrected_text": Value("string"),
+            "correction_policy": Value("string"),
+            "annotation_status": Value("string"),
+            "selection_reasons_json": Value("string"),
+            "pre_correction_features_json": Value("string"),
+            "post_correction_features_json": Value("string"),
+            "llm_annotation_json": Value("string"),
+            "automatic_risk_flags_json": Value("string"),
+            "human_verification_json": Value("string"),
+            "source_metadata_json": Value("string"),
+        }
+    )
 
 
 def make_hf_dataset_from_jsonl(
@@ -939,26 +1027,34 @@ def make_hf_dataset_from_jsonl(
     if not records:
         raise ValueError(f"No records found in {jsonl_path}")
 
+    records = [flatten_record_for_hf(r) for r in records]
+
     rng = random.Random(seed)
     rng.shuffle(records)
 
     n_total = len(records)
-    n_test = int(n_total * test_ratio)
-    n_val = int(n_total * validation_ratio)
+
+    if n_total < 10:
+        n_test = 0
+        n_val = 0
+    else:
+        n_test = int(n_total * test_ratio)
+        n_val = int(n_total * validation_ratio)
 
     test_records = records[:n_test]
     val_records = records[n_test : n_test + n_val]
     train_records = records[n_test + n_val :]
 
-    dataset_dict = DatasetDict()
+    features = flat_hf_features()
 
-    dataset_dict["train"] = Dataset.from_list(train_records)
+    dataset_dict = DatasetDict()
+    dataset_dict["train"] = Dataset.from_list(train_records, features=features)
 
     if val_records:
-        dataset_dict["validation"] = Dataset.from_list(val_records)
+        dataset_dict["validation"] = Dataset.from_list(val_records, features=features)
 
     if test_records:
-        dataset_dict["test"] = Dataset.from_list(test_records)
+        dataset_dict["test"] = Dataset.from_list(test_records, features=features)
 
     return dataset_dict
 
@@ -978,9 +1074,8 @@ language:
 - {language}
 task_categories:
 - text2text-generation
-- token-classification
 - text-classification
-pretty_name: ChronoCorrect Europeana
+pretty_name: ChronoCorrect Europeana FR
 tags:
 - historical-newspapers
 - ocr-post-correction
@@ -991,7 +1086,7 @@ tags:
 - temporal-expressions
 ---
 
-# ChronoCorrect-Europeana
+# ChronoCorrect-Europeana-FR
 
 This dataset is a derived post-OCR correction resource built from `{source_dataset}`.
 
@@ -1015,25 +1110,31 @@ The pipeline:
 - `ocr_text`: original OCR paragraph.
 - `corrected_text`: conservative OCR post-correction candidate.
 - `correction_policy`: currently `conservative`.
-- `selection_reasons`: why the paragraph was selected.
-- `pre_correction_features`: entities, dates, and numbers detected before correction.
-- `post_correction_features`: entities, dates, and numbers detected after correction.
-- `llm_annotation`: structured LLM annotation of correction types and semantic changes.
-- `automatic_risk_flags`: automatic flags for entity/date/number changes, hallucination risk, and overcorrection risk.
-- `human_verification`: placeholder fields for manual validation.
+- `annotation_status`: silver or silver-needs-review status.
+- `selection_reasons_json`: JSON string describing why the example was selected.
+- `pre_correction_features_json`: JSON string with entities/dates/numbers before correction.
+- `post_correction_features_json`: JSON string with entities/dates/numbers after correction.
+- `llm_annotation_json`: JSON string containing correction tags and semantic change annotations.
+- `automatic_risk_flags_json`: JSON string containing automatic risk flags.
+- `human_verification_json`: JSON string with manual verification placeholders.
+- `source_metadata_json`: JSON string with source metadata.
 
 ## Important note
 
-This is a silver dataset. The `corrected_text` and `llm_annotation` fields are generated automatically and should be treated as candidate annotations unless `annotation_status` indicates human verification.
+This is a silver dataset. The `corrected_text` and `llm_annotation_json` fields are generated automatically and should be treated as candidate annotations unless manually verified.
 
-## Intended uses
+## Loading JSON metadata
 
-- OCR post-correction
-- Conservative historical text repair
-- Entity-aware OCR correction
-- Date and number preservation evaluation
-- Hallucination and overcorrection analysis
-- Downstream historical NLP evaluation
+```python
+import json
+from datasets import load_dataset
+
+ds = load_dataset("EmanuelaBoros/chronocorrect-europeana-fr")
+ex = ds["train"][0]
+
+llm_annotation = json.loads(ex["llm_annotation_json"])
+risk_flags = json.loads(ex["automatic_risk_flags_json"])
+```
 
 ## Limitations
 
@@ -1042,10 +1143,6 @@ The corrections are automatically generated and may contain errors. The dataset 
 ## Source
 
 Derived from `{source_dataset}`.
-
-## Citation
-
-Please cite the original Europeana Newspapers source dataset and this derived dataset if used.
 """
 
     with open(readme_path, "w", encoding="utf-8") as f:
@@ -1058,7 +1155,7 @@ def export_and_optionally_push_to_hub(args) -> None:
     if not args.export_hf and not args.push_to_hub:
         return
 
-    tqdm.write("[hf] Loading JSONL output into Hugging Face DatasetDict")
+    tqdm.write("[hf] Loading JSONL output into flat Hugging Face DatasetDict")
 
     dataset_dict = make_hf_dataset_from_jsonl(
         jsonl_path=args.output_jsonl,
@@ -1068,6 +1165,7 @@ def export_and_optionally_push_to_hub(args) -> None:
     )
 
     tqdm.write(f"[hf] DatasetDict created: {dataset_dict}")
+    tqdm.write(f"[hf] Features: {dataset_dict['train'].features}")
 
     if args.hf_output_dir:
         tqdm.write(f"[hf] Saving dataset locally to: {args.hf_output_dir}")
@@ -1090,8 +1188,7 @@ def export_and_optionally_push_to_hub(args) -> None:
         if args.hf_token:
             if hf_login is None:
                 raise RuntimeError(
-                    "huggingface_hub is not installed. "
-                    "Install with: pip install huggingface_hub"
+                    "huggingface_hub is not installed. Install with: pip install huggingface_hub"
                 )
 
             tqdm.write("[hf] Logging in with provided HF token")
@@ -1120,215 +1217,57 @@ def parse_args() -> argparse.Namespace:
         description="Build ChronoCorrect-Europeana from biglam/europeana_newspapers."
     )
 
-    parser.add_argument(
-        "--dataset-name",
-        default="biglam/europeana_newspapers",
-        help="HF dataset name.",
-    )
+    parser.add_argument("--dataset-name", default="biglam/europeana_newspapers")
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--language", default="fr")
+    parser.add_argument("--output-jsonl", required=True)
+
+    parser.add_argument("--max-pages", type=int, default=None)
+    parser.add_argument("--max-examples", type=int, default=1000)
 
     parser.add_argument(
-        "--split",
-        default="train",
-        help="HF split to load.",
-    )
-
-    parser.add_argument(
-        "--language",
-        default="fr",
-        help="Target language code, e.g. fr.",
-    )
-
-    parser.add_argument(
-        "--output-jsonl",
-        required=True,
-        help="Output JSONL file.",
-    )
-
-    parser.add_argument(
-        "--max-pages",
+        "--target-total-examples",
         type=int,
         default=None,
-        help="Maximum source pages/documents to scan.",
+        help=(
+            "If used with --resume, continue until the output JSONL contains this "
+            "many total valid records."
+        ),
     )
 
-    parser.add_argument(
-        "--max-examples",
-        type=int,
-        default=1000,
-        help="Maximum selected paragraph examples to output.",
-    )
+    parser.add_argument("--min-chars", type=int, default=120)
+    parser.add_argument("--max-chars", type=int, default=1200)
+    parser.add_argument("--low-ocr-threshold", type=float, default=0.80)
+    parser.add_argument("--spacy-model", default="fr_core_news_md")
+    parser.add_argument("--model-correction", default="gpt-5-mini")
+    parser.add_argument("--model-annotation", default="gpt-5-mini")
 
-    parser.add_argument(
-        "--min-chars",
-        type=int,
-        default=120,
-        help="Minimum paragraph length.",
-    )
+    parser.add_argument("--no-api", action="store_true")
+    parser.add_argument("--select-all", action="store_true")
 
-    parser.add_argument(
-        "--max-chars",
-        type=int,
-        default=1200,
-        help="Maximum paragraph length.",
-    )
+    parser.add_argument("--streaming", action="store_true", default=True)
+    parser.add_argument("--no-streaming", action="store_false", dest="streaming")
+    parser.add_argument("--trust-remote-code", action="store_true")
 
-    parser.add_argument(
-        "--low-ocr-threshold",
-        type=float,
-        default=0.80,
-        help="Mean OCR confidence threshold for low OCR selection.",
-    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--api-retries", type=int, default=3)
+    parser.add_argument("--gold-candidate-risk-threshold", type=int, default=2)
+    parser.add_argument("--verbose", action="store_true")
 
-    parser.add_argument(
-        "--spacy-model",
-        default="fr_core_news_md",
-        help="spaCy model for NER.",
-    )
-
-    parser.add_argument(
-        "--model-correction",
-        default="gpt-5-mini",
-        help="OpenAI model for correction.",
-    )
-
-    parser.add_argument(
-        "--model-annotation",
-        default="gpt-5-mini",
-        help="OpenAI model for structured annotation.",
-    )
-
-    parser.add_argument(
-        "--no-api",
-        action="store_true",
-        help="Do not call OpenAI API. Use OCR text as corrected_text placeholder.",
-    )
-
-    parser.add_argument(
-        "--select-all",
-        action="store_true",
-        help="Select all valid paragraphs, not only semantic/low-OCR ones.",
-    )
-
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        default=True,
-        help="Use HF streaming mode.",
-    )
-
-    parser.add_argument(
-        "--no-streaming",
-        action="store_false",
-        dest="streaming",
-        help="Disable HF streaming.",
-    )
-
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Pass trust_remote_code=True to load_dataset.",
-    )
-
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from existing output JSONL, skipping existing IDs.",
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=13,
-        help="Random seed.",
-    )
-
-    parser.add_argument(
-        "--sleep",
-        type=float,
-        default=0.0,
-        help="Sleep seconds between API examples.",
-    )
-
-    parser.add_argument(
-        "--api-retries",
-        type=int,
-        default=3,
-        help="Number of retries for API calls.",
-    )
-
-    parser.add_argument(
-        "--gold-candidate-risk-threshold",
-        type=int,
-        default=2,
-        help="Risk score threshold for needs_human_verification.",
-    )
-
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print extra progress messages.",
-    )
-
-    parser.add_argument(
-        "--export-only",
-        action="store_true",
-        help="Only export/push an existing JSONL file; do not build new records.",
-    )
-
-    parser.add_argument(
-        "--export-hf",
-        action="store_true",
-        help="Convert output JSONL to a Hugging Face DatasetDict and save locally.",
-    )
-
-    parser.add_argument(
-        "--hf-output-dir",
-        default="hf_dataset",
-        help="Local directory for DatasetDict.save_to_disk().",
-    )
-
-    parser.add_argument(
-        "--validation-ratio",
-        type=float,
-        default=0.1,
-        help="Validation split ratio for HF export.",
-    )
-
-    parser.add_argument(
-        "--test-ratio",
-        type=float,
-        default=0.1,
-        help="Test split ratio for HF export.",
-    )
-
-    parser.add_argument(
-        "--push-to-hub",
-        action="store_true",
-        help="Push the exported DatasetDict to the Hugging Face Hub.",
-    )
-
-    parser.add_argument(
-        "--hub-dataset-id",
-        default=None,
-        help="HF dataset repo ID, e.g. EmanuelaBoros/chronocorrect-europeana-fr-mini.",
-    )
-
-    parser.add_argument(
-        "--hf-token",
-        default=os.getenv("HF_TOKEN"),
-        help="HF token. Defaults to HF_TOKEN environment variable.",
-    )
-
-    parser.add_argument(
-        "--private",
-        action="store_true",
-        help="Create/push the HF dataset as private.",
-    )
-
+    parser.add_argument("--export-only", action="store_true")
+    parser.add_argument("--export-hf", action="store_true")
+    parser.add_argument("--hf-output-dir", default="hf_dataset")
+    parser.add_argument("--validation-ratio", type=float, default=0.1)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--push-to-hub", action="store_true")
+    parser.add_argument("--hub-dataset-id", default=None)
+    parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN"))
+    parser.add_argument("--private", action="store_true")
     parser.add_argument(
         "--commit-message",
         default="Upload ChronoCorrect-Europeana dataset",
-        help="Commit message for push_to_hub.",
     )
 
     return parser.parse_args()
@@ -1351,6 +1290,7 @@ def main() -> None:
     tqdm.write(f"[setup] Language: {args.language}")
     tqdm.write(f"[setup] Output: {args.output_jsonl}")
     tqdm.write(f"[setup] Max examples: {args.max_examples}")
+    tqdm.write(f"[setup] Target total examples: {args.target_total_examples}")
     tqdm.write(f"[setup] Max pages: {args.max_pages}")
     tqdm.write(f"[setup] No API mode: {args.no_api}")
     tqdm.write(f"[setup] Export only: {args.export_only}")
@@ -1369,9 +1309,35 @@ def main() -> None:
         tqdm.write("[setup] Skipping OpenAI client because --no-api is enabled")
 
     existing_ids = load_existing_ids(args.output_jsonl) if args.resume else set()
+    existing_records_count = (
+        count_jsonl_records(args.output_jsonl) if args.resume else 0
+    )
 
     if args.resume:
         tqdm.write(f"[setup] Resume enabled. Existing IDs loaded: {len(existing_ids)}")
+        tqdm.write(f"[setup] Existing valid JSONL records: {existing_records_count}")
+
+    if args.target_total_examples is not None:
+        if not args.resume:
+            tqdm.write(
+                "[warning] --target-total-examples is most useful with --resume. "
+                "Continuing anyway."
+            )
+
+        remaining_to_write = max(args.target_total_examples - existing_records_count, 0)
+
+        tqdm.write(f"[setup] Target total examples: {args.target_total_examples}")
+        tqdm.write(f"[setup] Remaining examples to write: {remaining_to_write}")
+    else:
+        remaining_to_write = args.max_examples
+        tqdm.write(
+            f"[setup] No target total set. Will write up to {remaining_to_write} new examples."
+        )
+
+    if remaining_to_write == 0:
+        tqdm.write("[setup] Target already reached. Nothing new to generate.")
+        export_and_optionally_push_to_hub(args)
+        return
 
     tqdm.write("[setup] Loading Hugging Face dataset stream")
 
@@ -1400,14 +1366,14 @@ def main() -> None:
     }
 
     pbar = tqdm(
-        total=args.max_examples,
-        desc="Writing ChronoCorrect records",
+        total=remaining_to_write,
+        desc="Writing new ChronoCorrect records",
         unit="example",
         leave=True,
     )
 
     for candidate in candidates:
-        if written >= args.max_examples:
+        if written >= remaining_to_write:
             break
 
         step_stats["seen_candidates"] += 1
@@ -1429,7 +1395,7 @@ def main() -> None:
             {
                 "stage": "candidate",
                 "seen": step_stats["seen_candidates"],
-                "written": written,
+                "written_new": written,
                 "risk": step_stats["risk_flagged"],
             }
         )
@@ -1442,13 +1408,13 @@ def main() -> None:
                 {
                     "stage": "skip_existing",
                     "skipped": step_stats["skipped_existing"],
-                    "written": written,
+                    "written_new": written,
                 }
             )
             continue
 
         if args.no_api:
-            pbar.set_postfix({"stage": "no_api_placeholder", "written": written})
+            pbar.set_postfix({"stage": "no_api_placeholder", "written_new": written})
 
             corrected_text = candidate.ocr_text
 
@@ -1468,7 +1434,7 @@ def main() -> None:
                 pbar.set_postfix(
                     {
                         "stage": "gpt_correction",
-                        "written": written,
+                        "written_new": written,
                         "chars": len(candidate.ocr_text),
                     }
                 )
@@ -1487,7 +1453,7 @@ def main() -> None:
                 pbar.set_postfix(
                     {
                         "stage": "gpt_annotation",
-                        "written": written,
+                        "written_new": written,
                         "corrected": step_stats["corrected"],
                     }
                 )
@@ -1514,11 +1480,11 @@ def main() -> None:
 
                 raise
 
-        pbar.set_postfix({"stage": "post_ner", "written": written})
+        pbar.set_postfix({"stage": "post_ner", "written_new": written})
 
         post_features = detect_entities_dates_numbers(corrected_text, nlp=nlp)
 
-        pbar.set_postfix({"stage": "risk_flags", "written": written})
+        pbar.set_postfix({"stage": "risk_flags", "written_new": written})
 
         risk_flags = automatic_risk_flags(
             ocr_text=candidate.ocr_text,
@@ -1538,7 +1504,7 @@ def main() -> None:
         pbar.set_postfix(
             {
                 "stage": "writing",
-                "written": written,
+                "written_new": written,
                 "risk": step_stats["risk_flagged"],
             }
         )
@@ -1580,6 +1546,7 @@ def main() -> None:
 
         write_jsonl_record(args.output_jsonl, record)
 
+        existing_ids.add(record_id)
         written += 1
         step_stats["written"] = written
 
@@ -1588,20 +1555,23 @@ def main() -> None:
         pbar.set_postfix(
             {
                 "stage": "done_record",
-                "written": written,
+                "written_new": written,
+                "total_now": existing_records_count + written,
                 "risk": step_stats["risk_flagged"],
                 "api_errors": step_stats["api_errors"],
             }
         )
 
         if args.sleep > 0:
-            pbar.set_postfix({"stage": f"sleep_{args.sleep}s", "written": written})
+            pbar.set_postfix({"stage": f"sleep_{args.sleep}s", "written_new": written})
             time.sleep(args.sleep)
 
     pbar.close()
 
     print("\nDone.")
-    print(f"Wrote: {written}")
+    print(f"Existing records before run: {existing_records_count}")
+    print(f"New records written: {written}")
+    print(f"Estimated total records now: {existing_records_count + written}")
     print(f"Skipped existing: {skipped_existing}")
     print(f"Output: {args.output_jsonl}")
 
