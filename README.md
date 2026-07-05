@@ -12,3 +12,40 @@ Create and activate an environment, then install dependencies:
 pip install -r requirements.txt
 python -m spacy download fr_core_news_md
 ```
+
+## API keys
+
+The script reads API keys from environment variables.
+
+For OpenAI:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+For Hugging Face upload:
+
+```bash
+export HF_TOKEN="hf_..."
+```
+
+Do **not** commit API keys, `.env` files, generated JSONL files, or local dataset folders.
+
+## Quick dry run without API
+
+Use this to test loading, filtering, splitting, and writing without spending OpenAI credits:
+
+```bash
+python build_dataset.py \
+  --output-jsonl outputs/test_no_api.jsonl \
+  --max-examples 20 \
+  --max-pages 500 \
+  --language fr \
+  --no-api \
+  --verbose
+```
+
+This writes placeholder examples where `corrected_text` equals `ocr_text`.
+
+
+
